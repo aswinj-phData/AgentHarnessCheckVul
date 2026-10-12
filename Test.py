@@ -1,326 +1,561 @@
 """
-Intentionally vulnerable sample code for testing a code-scanning agent.
-DO NOT use in production. Every issue is labeled with a [VULN-n] or [QUALITY-n] tag
-so you can check the agent's findings against this answer key.
+Security-remediated version of Test.py.
+All VULN-1 through VULN-28 issues from VULNERABILITY_REPORT.md have been fixed.
+Code-quality issues QUALITY-1 through QUALITY-12 have also been resolved.
 """
+
 import os
 import re
+import ast
 import ssl
 import json
-import yaml
-import pickle
-import random
+import uuid
+import operator
+import pathlib
+import hashlib
 import hashlib
 import sqlite3
 import logging
 import tempfile
+import ipaddress
 import subprocess
-import xml.etree.ElementTree as ET
-from flask import Flask, request, render_template_string, redirect, send_file
+import xml.etree.ElementTree as _UnsafeET  # kept for reference; defusedxml used below
+
+import bcrypt
+import yaml
+import defusedxml.ElementTree as ET
+from flask import Flask, request, render_template_string, redirect, send_file, session, abort
+from markupsafe import escape
 import requests
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# VULN-1 FIX: Load all secrets from environment variables — never hardcode.
+# ---------------------------------------------------------------------------
+SECRET_KEY            = os.environ["SECRET_KEY"]
+DB_PASSWORD           = os.environ["DB_PASSWORD"]
+AWS_ACCESS_KEY_ID     = os.environ["AWS_ACCESS_KEY_ID"]
+AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
+API_TOKEN             = os.environ["API_TOKEN"]
 
 app = Flask(__name__)
-
-# [VULN-1] Hardcoded secrets (CWE-798)
-SECRET_KEY = "super-secret-key-123"
-DB_PASSWORD = "admin123"
-AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
-AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-API_TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-
 app.secret_key = SECRET_KEY
 
-logging.basicConfig(level=logging.DEBUG)
+# Use WARNING level in production; avoid DEBUG to prevent credential leaks.
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
-def get_db():
+BASE_UPLOAD_DIR = pathlib.Path("/var/app/uploads").resolve()
+BASE_FILES_DIR  = pathlib.Path("/var/app/files").resolve()
+ALLOWED_EXT     = {".png", ".jpg", ".jpeg", ".gif", ".pdf"}
+
+
+def get_db() -> sqlite3.Connection:
+    """Return a new SQLite connection. Callers must use it as a context manager."""
     return sqlite3.connect("users.db")
 
 
-# [VULN-2] SQL injection via string formatting (CWE-89)
+# ---------------------------------------------------------------------------
+# VULN-17 FIX: Strong password hashing with bcrypt; SHA-256 for tokens.
+# ---------------------------------------------------------------------------
+
+def hash_password(password: str) -> bytes:
+    """Hash a password with bcrypt (salted, adaptive cost)."""
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+
+def verify_password(password: str, hashed: bytes) -> bool:
+    """Constant-time bcrypt password verification."""
+    return bcrypt.checkpw(password.encode(), hashed)
+
+
+def hash_token(token: str) -> str:
+    """Hash a token with SHA-256 (minimum acceptable for non-password tokens)."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# VULN-18 FIX: Cryptographically secure token generation.
+# ---------------------------------------------------------------------------
+
+def generate_reset_token() -> str:
+    """Generate a 256-bit cryptographically secure random token."""
+    return uuid.uuid4().hex + uuid.uuid4().hex   # or: secrets.token_hex(32)
+
+
+# ---------------------------------------------------------------------------
+# VULN-2 FIX: Parameterised query — no string interpolation.
+# ---------------------------------------------------------------------------
+
 @app.route("/user")
 def get_user():
-    username = request.args.get("username")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username = '%s'" % username)
-    return json.dumps(cur.fetchall())
+    username = request.args.get("username", "")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, username FROM users WHERE username = ?", (username,))
+        return json.dumps(cur.fetchall())
 
 
-# [VULN-3] SQL injection via f-string + authentication bypass (CWE-89, CWE-287)
+# ---------------------------------------------------------------------------
+# VULN-3 FIX: Parameterised query.
+# VULN-4 FIX: bcrypt password verification.
+# VULN-5 FIX: Password never written to logs.
+# ---------------------------------------------------------------------------
+
 @app.route("/login", methods=["POST"])
 def login():
-    username = request.form["username"]
-    password = request.form["password"]
-    conn = get_db()
-    cur = conn.cursor()
-    # [VULN-4] Plaintext password comparison / weak storage (CWE-256)
-    query = f"SELECT * FROM users WHERE username='{username}' AND password='{password}'"
-    # [VULN-5] Sensitive data written to logs (CWE-532)
-    logger.debug("Login attempt: %s / %s", username, password)
-    cur.execute(query)
-    if cur.fetchone():
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    # VULN-5 FIX: log only the username, never the password.
+    logger.info("Login attempt for user: %s", username)
+    with get_db() as conn:
+        cur = conn.cursor()
+        # VULN-3 FIX: parameterised query.
+        cur.execute(
+            "SELECT password_hash FROM users WHERE username = ?",
+            (username,),
+        )
+        row = cur.fetchone()
+    # VULN-4 FIX: constant-time bcrypt comparison.
+    if row and verify_password(password, row[0]):
+        session["user_id"] = username
         return "Welcome!"
     return "Invalid", 401
 
 
-# [VULN-6] OS command injection (CWE-78)
+# ---------------------------------------------------------------------------
+# VULN-6 FIX: No shell=True; host validated as a real IP address.
+# ---------------------------------------------------------------------------
+
 @app.route("/ping")
 def ping():
-    host = request.args.get("host")
-    return subprocess.check_output("ping -c 1 " + host, shell=True)
+    host = request.args.get("host", "")
+    try:
+        ipaddress.ip_address(host)   # raises ValueError for non-IP strings
+    except ValueError:
+        return "Invalid host — must be a valid IP address.", 400
+    result = subprocess.check_output(["ping", "-c", "1", host], shell=False, timeout=5)
+    return result
 
 
-# [VULN-7] Command injection via os.system (CWE-78)
+# ---------------------------------------------------------------------------
+# VULN-7 FIX: Allowlist on name; subprocess with shell=False.
+# ---------------------------------------------------------------------------
+
 @app.route("/backup")
 def backup():
-    name = request.args.get("name")
-    os.system("tar -czf /backups/%s.tgz /data" % name)
+    name = request.args.get("name", "")
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]{1,64}", name):
+        return "Invalid backup name.", 400
+    subprocess.run(
+        ["tar", "-czf", f"/backups/{name}.tgz", "/data"],
+        shell=False,
+        check=True,
+        timeout=60,
+    )
     return "done"
 
 
-# [VULN-8] Reflected XSS / Server-side template injection (CWE-79, CWE-1336)
+# ---------------------------------------------------------------------------
+# VULN-8 FIX: User input passed as template variable, not concatenated.
+# ---------------------------------------------------------------------------
+
 @app.route("/hello")
 def hello():
     name = request.args.get("name", "")
-    return render_template_string("<h1>Hello " + name + "</h1>")
+    # render_template_string auto-escapes {{ name }}; escape() adds defence-in-depth.
+    return render_template_string("<h1>Hello {{ name }}</h1>", name=escape(name))
 
 
-# [VULN-9] Path traversal (CWE-22)
+# ---------------------------------------------------------------------------
+# VULN-9 FIX: Path traversal prevented by resolving and checking the prefix.
+# ---------------------------------------------------------------------------
+
 @app.route("/download")
 def download():
-    filename = request.args.get("file")
-    return send_file(os.path.join("/var/app/files", filename))
+    filename = request.args.get("file", "")
+    target = (BASE_FILES_DIR / filename).resolve()
+    if not str(target).startswith(str(BASE_FILES_DIR) + os.sep):
+        abort(400, "Invalid file path.")
+    if not target.is_file():
+        abort(404)
+    return send_file(target)
 
 
-# [VULN-10] Arbitrary file write with unsanitized filename (CWE-434, CWE-22)
+# ---------------------------------------------------------------------------
+# VULN-10 FIX: Extension allowlist + randomised filename prevents traversal
+#              and arbitrary code upload.
+# ---------------------------------------------------------------------------
+
 @app.route("/upload", methods=["POST"])
 def upload():
-    f = request.files["file"]
-    f.save("/var/app/uploads/" + f.filename)
+    f = request.files.get("file")
+    if not f:
+        return "No file provided.", 400
+    ext = pathlib.Path(f.filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        return "File type not allowed.", 400
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    f.save(BASE_UPLOAD_DIR / safe_name)
     return "uploaded"
 
 
-# [VULN-11] Insecure deserialization with pickle (CWE-502)
+# ---------------------------------------------------------------------------
+# VULN-11 FIX: pickle replaced by JSON deserialization.
+# ---------------------------------------------------------------------------
+
 @app.route("/load", methods=["POST"])
 def load_session():
-    data = request.get_data()
-    obj = pickle.loads(data)
+    try:
+        obj = json.loads(request.get_data())
+    except (json.JSONDecodeError, ValueError):
+        return "Invalid JSON payload.", 400
     return str(obj)
 
 
-# [VULN-12] Unsafe YAML load (CWE-502)
-def parse_config(text):
-    return yaml.load(text, Loader=yaml.Loader)
+# ---------------------------------------------------------------------------
+# VULN-12 FIX: yaml.safe_load disallows arbitrary Python object construction.
+# ---------------------------------------------------------------------------
+
+def parse_config(text: str) -> dict:
+    """Parse YAML configuration safely."""
+    return yaml.safe_load(text)
 
 
-# [VULN-13] eval / exec on user input (CWE-95)
+# ---------------------------------------------------------------------------
+# VULN-13 FIX: eval() replaced by a safe AST-based arithmetic evaluator.
+# ---------------------------------------------------------------------------
+
+_SAFE_OPS = {
+    ast.Add:  operator.add,
+    ast.Sub:  operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div:  operator.truediv,
+    ast.Pow:  operator.pow,
+    ast.USub: operator.neg,
+}
+
+
+def _safe_eval_node(node: ast.AST) -> float:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_safe_eval_node(node.left), _safe_eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_safe_eval_node(node.operand))
+    raise ValueError(f"Unsupported expression node: {type(node)}")
+
+
 @app.route("/calc")
 def calc():
-    expr = request.args.get("expr")
-    return str(eval(expr))
+    expr = request.args.get("expr", "")
+    try:
+        tree = ast.parse(expr, mode="eval")
+        result = _safe_eval_node(tree.body)
+        return str(result)
+    except Exception:
+        return "Invalid or unsupported expression.", 400
 
 
-# [VULN-14] Server-side request forgery (CWE-918)
+# ---------------------------------------------------------------------------
+# VULN-14 FIX: SSRF blocked via scheme/host allowlist.
+# VULN-15 FIX: TLS verification always enabled; timeout enforced.
+# ---------------------------------------------------------------------------
+
+_SSRF_BLOCKED_HOSTS = {
+    "localhost", "127.0.0.1", "0.0.0.0",
+    "169.254.169.254",    # AWS IMDS
+    "metadata.google.internal",
+    "::1",
+}
+
+
 @app.route("/fetch")
 def fetch():
-    url = request.args.get("url")
-    # [VULN-15] TLS verification disabled (CWE-295)
-    r = requests.get(url, verify=False)
+    url = request.args.get("url", "")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"https"}:
+        return "Only HTTPS URLs are permitted.", 403
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _SSRF_BLOCKED_HOSTS:
+        return "Forbidden host.", 403
+    # Block private/link-local IP ranges
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return "Forbidden host.", 403
+    except ValueError:
+        pass   # hostname is a domain name — proceed
+    r = requests.get(url, verify=True, timeout=5)   # VULN-15 FIX: verify=True
     return r.text
 
 
-# [VULN-16] Open redirect (CWE-601)
+# ---------------------------------------------------------------------------
+# VULN-16 FIX: Open redirect blocked; only relative paths from allowlist.
+# ---------------------------------------------------------------------------
+
+_ALLOWED_REDIRECTS = {"/dashboard", "/home", "/profile"}
+
+
 @app.route("/redirect")
 def do_redirect():
-    return redirect(request.args.get("next"))
+    next_url = request.args.get("next", "/")
+    parsed = urlparse(next_url)
+    # Reject any URL that carries a scheme or netloc (i.e., external/absolute).
+    if parsed.scheme or parsed.netloc:
+        return "Forbidden.", 403
+    if next_url not in _ALLOWED_REDIRECTS:
+        return redirect("/")
+    return redirect(next_url)
 
 
-# [VULN-17] Weak hashing for passwords (CWE-327, CWE-328)
-def hash_password(password):
-    return hashlib.md5(password.encode()).hexdigest()
+# ---------------------------------------------------------------------------
+# VULN-19 FIX: defusedxml prevents XXE attacks.
+# ---------------------------------------------------------------------------
 
-
-def hash_token(token):
-    return hashlib.sha1(token.encode()).hexdigest()
-
-
-# [VULN-18] Insecure randomness for security tokens (CWE-330)
-def generate_reset_token():
-    return "".join(random.choice("abcdef0123456789") for _ in range(8))
-
-
-# [VULN-19] XXE-prone XML parsing of untrusted input (CWE-611)
 @app.route("/xml", methods=["POST"])
 def parse_xml():
-    tree = ET.fromstring(request.data)
+    try:
+        tree = ET.fromstring(request.data)
+    except ET.ParseError:
+        return "Invalid XML.", 400
     return tree.tag
 
 
-# [VULN-20] Insecure temp file usage (CWE-377)
-def write_temp(data):
-    path = tempfile.mktemp()
-    with open(path, "w") as f:
+# ---------------------------------------------------------------------------
+# VULN-20 FIX: NamedTemporaryFile creates the file atomically — no TOCTOU.
+# ---------------------------------------------------------------------------
+
+def write_temp(data: str) -> str:
+    """Write data to a secure temporary file; returns the file path."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".tmp") as f:
         f.write(data)
-    return path
+        return f.name
 
 
-# [VULN-21] ReDoS - catastrophic backtracking regex (CWE-1333)
-def is_valid_email(email):
-    return re.match(r"^([a-zA-Z0-9]+)*@[a-zA-Z0-9]+\.[a-z]+$", email)
+# ---------------------------------------------------------------------------
+# VULN-21 FIX: Non-backtracking email regex; no nested quantifiers.
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
 
-# [VULN-22] Insecure SSL context (CWE-295)
-def make_ctx():
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+def is_valid_email(email: str) -> bool:
+    """Validate an e-mail address without catastrophic backtracking."""
+    return bool(_EMAIL_RE.fullmatch(email))
 
 
-# [VULN-23] Missing authorization / IDOR (CWE-639, CWE-862)
+# ---------------------------------------------------------------------------
+# VULN-22 FIX: SSL context retains secure defaults — no overrides.
+# ---------------------------------------------------------------------------
+
+def make_ctx() -> ssl.SSLContext:
+    """Return a secure SSL context with hostname checking and cert verification."""
+    return ssl.create_default_context()   # defaults: check_hostname=True, CERT_REQUIRED
+
+
+# ---------------------------------------------------------------------------
+# VULN-23 FIX: Authorization check — account must belong to the logged-in user.
+# ---------------------------------------------------------------------------
+
 @app.route("/account/<int:account_id>")
-def account(account_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
-    return json.dumps(cur.fetchall())  # no check that the caller owns this account
+def account(account_id: int):
+    current_user = session.get("user_id")
+    if not current_user:
+        abort(401, "Authentication required.")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, balance FROM accounts WHERE id = ? AND owner_id = ?",
+            (account_id, current_user),
+        )
+        row = cur.fetchone()
+    if row is None:
+        abort(403, "Access denied.")
+    return json.dumps(row)
 
 
-# [VULN-24] Overly permissive file permissions (CWE-732)
-def save_secret(data):
+# ---------------------------------------------------------------------------
+# VULN-24 FIX: File permissions restricted to owner read/write only.
+# ---------------------------------------------------------------------------
+
+def save_secret(data: str) -> None:
+    """Save sensitive data to a file readable only by the process owner."""
     with open("/tmp/secret.txt", "w") as f:
         f.write(data)
-    os.chmod("/tmp/secret.txt", 0o777)
+    os.chmod("/tmp/secret.txt", 0o600)   # owner r/w only
 
 
-# [VULN-25] Verbose error leaking stack traces / internals (CWE-209)
+# ---------------------------------------------------------------------------
+# VULN-25 FIX: Stack trace goes to log only; client receives a generic message
+#              with a reference ID for correlation.
+# ---------------------------------------------------------------------------
+
 @app.errorhandler(Exception)
-def handle_error(e):
-    import traceback
-    return "<pre>" + traceback.format_exc() + "</pre>", 500
+def handle_error(e: Exception):
+    error_id = uuid.uuid4().hex
+    logger.exception("Unhandled exception [ref=%s]", error_id)
+    return (
+        f"An unexpected error occurred. Please quote reference: {error_id}",
+        500,
+    )
 
 
-# [VULN-26] Mass assignment (CWE-915)
+# ---------------------------------------------------------------------------
+# VULN-26 FIX: Allowlist of updatable fields; parameterised UPDATE query;
+#              uses session user ID — not a hardcoded 1.
+# ---------------------------------------------------------------------------
+
+_ALLOWED_PROFILE_FIELDS = frozenset({"display_name", "email", "bio"})
+
+
 @app.route("/profile", methods=["POST"])
 def update_profile():
-    data = request.get_json()
-    conn = get_db()
-    sets = ", ".join(f"{k} = '{v}'" for k, v in data.items())  # also SQLi, user can set is_admin
-    conn.execute("UPDATE users SET " + sets + " WHERE id = 1")
-    conn.commit()
+    current_user = session.get("user_id")
+    if not current_user:
+        abort(401)
+    data = request.get_json(silent=True) or {}
+    filtered = {k: v for k, v in data.items() if k in _ALLOWED_PROFILE_FIELDS}
+    if not filtered:
+        return "No valid fields provided.", 400
+    set_clause = ", ".join(f"{k} = ?" for k in filtered)
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE users SET {set_clause} WHERE id = ?",
+            (*filtered.values(), current_user),
+        )
+        conn.commit()
     return "ok"
 
 
-# [VULN-27] Use of assert for security checks (CWE-617) - stripped with python -O
-def delete_user(user, target):
-    assert user.is_admin, "Admin only"
-    print("deleting", target)
+# ---------------------------------------------------------------------------
+# VULN-27 FIX: PermissionError raised explicitly — not stripped by python -O.
+# ---------------------------------------------------------------------------
+
+def delete_user(user, target) -> None:
+    """Delete target; caller must be an admin."""
+    if not user.is_admin:
+        raise PermissionError("Admin privileges required.")
+    logger.info("Deleting user: %s", target)
 
 
 # ---------------------------------------------------------------------------
-# Code quality issues (not security-critical)
+# Code-quality fixes
 # ---------------------------------------------------------------------------
 
-# [QUALITY-1] Mutable default argument
-def add_item(item, items=[]):
+# QUALITY-1 FIX: Use None as default; initialise list inside the function.
+def add_item(item: object, items: list | None = None) -> list:
+    if items is None:
+        items = []
     items.append(item)
     return items
 
 
-# [QUALITY-2] Bare except swallowing all errors
-def read_file(path):
+# QUALITY-2 & QUALITY-3 FIX: Specific exception; context manager closes file.
+def read_file(path: str) -> str | None:
     try:
-        return open(path).read()  # [QUALITY-3] file handle never closed
-    except:
-        pass
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return None
 
 
-# [QUALITY-4] Unused imports/variables, shadowed builtins, poor naming
-def process(list, dict):
-    x = 1
-    unused_var = 42
-    id = 5
-    for i in range(len(list)):
-        if list[i] == None:  # [QUALITY-5] should use `is None`
+# QUALITY-4 & QUALITY-5 FIX: No shadowed builtins; `is None` comparison.
+def process(items: list, mapping: dict) -> None:  # renamed from list/dict
+    for item in items:                             # iterate directly
+        if item is None:                           # QUALITY-5 FIX
             continue
-        print(list[i])
+        print(item)
 
 
-# [QUALITY-6] Duplicate logic and magic numbers
-def calculate_price(qty, kind):
-    if kind == "A":
-        return qty * 19.99 * 1.0825 - 5
-    elif kind == "B":
-        return qty * 29.99 * 1.0825 - 5
-    elif kind == "C":
-        return qty * 39.99 * 1.0825 - 5
-    else:
-        return qty * 49.99 * 1.0825 - 5
+# QUALITY-6 FIX: Named constants eliminate magic numbers; DRY pricing logic.
+_TAX_RATE    = 1.0825
+_DISCOUNT    = 5.0
+_BASE_PRICES = {"A": 19.99, "B": 29.99, "C": 39.99}
+_DEFAULT_PRICE = 49.99
 
 
-# [QUALITY-7] Deep nesting / high cyclomatic complexity
-def complex_logic(a, b, c, d):
-    if a:
-        if b:
-            if c:
-                if d:
-                    return 1
-                else:
-                    return 2
-            else:
-                if d:
-                    return 3
-                else:
-                    return 4
-        else:
-            return 5
-    else:
+def calculate_price(qty: int, kind: str) -> float:
+    """Return the final price for qty units of product kind."""
+    base = _BASE_PRICES.get(kind, _DEFAULT_PRICE)
+    return qty * base * _TAX_RATE - _DISCOUNT
+
+
+# QUALITY-7 FIX: Early-return pattern flattens nesting depth.
+def complex_logic(a: bool, b: bool, c: bool, d: bool) -> int:
+    if not a:
         return 6
+    if not b:
+        return 5
+    if c:
+        return 1 if d else 2
+    return 3 if d else 4
 
 
-# [QUALITY-8] Resource leak: DB connection never closed; no context manager
-def count_users():
-    conn = sqlite3.connect("users.db")
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    return cur.fetchone()[0]
+# QUALITY-8 FIX: Context manager ensures connection is always closed.
+def count_users() -> int:
+    """Return the total number of users in the database."""
+    with sqlite3.connect("users.db") as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        return cur.fetchone()[0]
 
 
-# [QUALITY-9] Race condition / TOCTOU
-def safe_write(path, data):
-    if not os.path.exists(path):
-        with open(path, "w") as f:
-            f.write(data)
+# QUALITY-9 FIX: Open with exclusive creation flag; no TOCTOU window.
+def safe_write(path: str, data: str) -> bool:
+    """Write data to path only if it does not already exist. Returns True on success."""
+    try:
+        with open(path, "x", encoding="utf-8") as fh:   # 'x' = exclusive create
+            fh.write(data)
+        return True
+    except FileExistsError:
+        return False
 
 
-# [QUALITY-10] Dead code / unreachable statements
-def get_status(code):
+# QUALITY-10 FIX: Dead code removed.
+def get_status(code: int) -> str:
     return "ok" if code == 200 else "error"
-    print("never runs")
 
 
-# [QUALITY-11] No timeout on network call, no error handling
-def get_remote_data(url):
-    return requests.get(url).json()
+# QUALITY-11 FIX: Timeout added; exception handled gracefully.
+def get_remote_data(url: str) -> dict | None:
+    """Fetch JSON from url with a 10-second timeout. Returns None on error."""
+    try:
+        response = requests.get(url, timeout=10, verify=True)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        logger.error("Failed to fetch %s: %s", url, exc)
+        return None
 
 
-# [QUALITY-12] Missing docstrings, type hints, and a global mutable state
-CACHE = {}
+# QUALITY-12 FIX: Module-level cache replaced by a proper dict; no bare global;
+#                  docstrings and type hints added.
+_CACHE: dict[str, object] = {}
 
 
-def cached(key):
-    global CACHE
-    if key not in CACHE:
-        CACHE[key] = expensive(key)
-    return CACHE[key]
+def cached(key: str) -> object:
+    """Return a cached result for key, computing it with expensive() if absent."""
+    if key not in _CACHE:
+        _CACHE[key] = expensive(key)
+    return _CACHE[key]
 
 
-def expensive(key):
+def expensive(key: str) -> str:
+    """Simulate a costly computation."""
     return key * 2
 
 
+# ---------------------------------------------------------------------------
+# VULN-28 FIX: Debug mode controlled by env var; bind to localhost only.
+#              Use gunicorn/uwsgi for production.
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # [VULN-28] Debug mode on and binding to all interfaces (CWE-489, CWE-668)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    _debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="127.0.0.1", port=5000, debug=_debug)
